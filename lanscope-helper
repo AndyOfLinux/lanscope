@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""lanscope-helper — privileged ARP sweep, the ONLY part that runs as root.
+
+Design goals:
+  * Zero third-party dependencies (stdlib only), so the privileged surface
+    is small and auditable.
+  * Takes no untrusted input beyond an optional interface name and timeout.
+  * Streams results as JSON lines on stdout the moment replies arrive:
+        {"ip": "192.168.254.37", "mac": "2c:cf:67:8b:8f:7d"}
+    and a final line {"done": true, "count": N}.
+
+Invoke via pkexec (see io.github.lanscope.policy) or sudo.
+"""
+
+import argparse
+import fcntl
+import ipaddress
+import json
+import os
+import select
+import socket
+import struct
+import sys
+import time
+
+ETH_P_ARP = 0x0806
+ARP_REQUEST = 1
+ARP_REPLY = 2
+MAX_HOSTS = 4096          # refuse to sweep anything bigger than a /20
+SIOCGIFADDR = 0x8915
+SIOCGIFNETMASK = 0x891B
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def default_interface():
+    """Interface of the default route, from /proc/net/route (no deps)."""
+    try:
+        with open("/proc/net/route") as f:
+            next(f)  # header
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 4 and fields[1] == "00000000":
+                    flags = int(fields[3], 16)
+                    if flags & 0x2:  # RTF_GATEWAY
+                        return fields[0]
+    except OSError:
+        pass
+    return None
+
+
+def iface_mac(iface):
+    with open(f"/sys/class/net/{iface}/address") as f:
+        return f.read().strip()
+
+
+def iface_ipv4(iface, sock):
+    """(ip, netmask) via ioctl on any dgram socket."""
+    packed = struct.pack("256s", iface.encode()[:15])
+    ip = socket.inet_ntoa(
+        fcntl.ioctl(sock.fileno(), SIOCGIFADDR, packed)[20:24])
+    mask = socket.inet_ntoa(
+        fcntl.ioctl(sock.fileno(), SIOCGIFNETMASK, packed)[20:24])
+    return ip, mask
+
+
+def build_arp_request(src_mac_b, src_ip_b, target_ip_b):
+    eth = b"\xff" * 6 + src_mac_b + struct.pack("!H", ETH_P_ARP)
+    arp = struct.pack(
+        "!HHBBH6s4s6s4s",
+        1,              # htype: Ethernet
+        0x0800,         # ptype: IPv4
+        6, 4,           # hlen, plen
+        ARP_REQUEST,
+        src_mac_b, src_ip_b,
+        b"\x00" * 6, target_ip_b,
+    )
+    return eth + arp
+
+
+def parse_arp_reply(frame):
+    """Return (ip, mac) if the frame is an ARP reply, else None."""
+    if len(frame) < 42:
+        return None
+    if struct.unpack("!H", frame[12:14])[0] != ETH_P_ARP:
+        return None
+    op = struct.unpack("!H", frame[20:22])[0]
+    if op != ARP_REPLY:
+        return None
+    sha = frame[22:28]
+    spa = frame[28:32]
+    mac = ":".join(f"{b:02x}" for b in sha)
+    ip = socket.inet_ntoa(spa)
+    return ip, mac
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Privileged ARP sweep helper")
+    ap.add_argument("--interface", "-i", help="network interface (default: default-route iface)")
+    ap.add_argument("--timeout", "-t", type=float, default=2.5,
+                    help="seconds to wait for replies after last request")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        emit({"error": "must run as root (use pkexec)"})
+        return 1
+
+    iface = args.interface or default_interface()
+    if not iface:
+        emit({"error": "could not determine default interface"})
+        return 1
+
+    dgram = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        src_ip, netmask = iface_ipv4(iface, dgram)
+    except OSError as e:
+        emit({"error": f"no IPv4 address on {iface}: {e}"})
+        return 1
+    finally:
+        dgram.close()
+
+    net = ipaddress.IPv4Network(f"{src_ip}/{netmask}", strict=False)
+    if net.num_addresses - 2 > MAX_HOSTS:
+        emit({"error": f"network {net} too large (>{MAX_HOSTS} hosts)"})
+        return 1
+
+    src_mac = iface_mac(iface)
+    src_mac_b = bytes.fromhex(src_mac.replace(":", ""))
+    src_ip_b = socket.inet_aton(src_ip)
+
+    emit({"info": {"interface": iface, "network": str(net),
+                   "self_ip": src_ip, "self_mac": src_mac}})
+    # ARP never answers for ourselves; report self directly.
+    emit({"ip": src_ip, "mac": src_mac, "self": True})
+
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                         socket.htons(ETH_P_ARP))
+    sock.bind((iface, 0))
+    sock.setblocking(False)
+
+    seen = {src_ip}
+    count = 1
+
+    def drain(wait):
+        nonlocal count
+        r, _, _ = select.select([sock], [], [], wait)
+        while r:
+            try:
+                frame = sock.recv(2048)
+            except BlockingIOError:
+                break
+            parsed = parse_arp_reply(frame)
+            if parsed and parsed[0] not in seen:
+                seen.add(parsed[0])
+                count += 1
+                emit({"ip": parsed[0], "mac": parsed[1]})
+            r, _, _ = select.select([sock], [], [], 0)
+
+    # Two passes for reliability on sleepy WiFi devices.
+    for _pass in range(2):
+        for host in net.hosts():
+            ip = str(host)
+            if ip == src_ip:
+                continue
+            try:
+                sock.send(build_arp_request(src_mac_b, src_ip_b,
+                                            socket.inet_aton(ip)))
+            except OSError:
+                time.sleep(0.02)          # tx buffer full — back off
+            if int(host) % 32 == 0:
+                drain(0.005)              # interleave rx with tx
+
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        drain(min(0.25, deadline - time.monotonic()))
+
+    sock.close()
+    emit({"done": True, "count": count})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

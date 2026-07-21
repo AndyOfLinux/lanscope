@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=LanScope
+Comment=LanScan-style LAN scanner
+Exec=lanscope
+Icon=network-workgroup
+Terminal=false
+Categories=Network;System;
