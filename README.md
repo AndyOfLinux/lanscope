@@ -42,8 +42,7 @@ Debian, etc).
 
 ## Screenshot
 
-_(add one here once you've got the app open — drag a PNG into this repo
-under `docs/` and reference it, e.g. `![LanScope](docs/screenshot.png)`)_
+![LanScope](LanScope_xubuntu.jpg)
 
 ## Architecture
 
