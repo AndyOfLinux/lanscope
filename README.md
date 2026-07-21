@@ -81,6 +81,7 @@ runs unprivileged in the GTK process.
 ```bash
 git clone https://github.com/<your-username>/lanscope.git
 cd lanscope
+chmod +x install-lanscope.sh lanscope-helper
 
 sudo apt install python3-gi gir1.2-gtk-3.0 arp-scan avahi-utils samba-common-bin
 sudo ./install-lanscope.sh
